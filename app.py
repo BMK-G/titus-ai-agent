@@ -1,68 +1,61 @@
 from flask import Flask, request, send_file
 import pandas as pd
+import tempfile
+import os
 
 app = Flask(__name__)
 
-@app.route('/process', methods=['POST'])
+@app.route("/process", methods=["POST"])
 def process_excel():
-    uploaded_file = request.files['file']
-    input_path = 'input.xlsx'
-    output_path = 'output.xlsx'
-    
-    uploaded_file.save(input_path)
+    if 'data' not in request.files:
+        return {"error": "No file uploaded under key 'data'"}, 400
 
-    xls = pd.ExcelFile(input_path)
-    df_all = pd.concat([xls.parse(sheet) for sheet in xls.sheet_names], ignore_index=True)
+    file = request.files['data']
 
-    df_all.dropna(how='all', inplace=True)
-    df_all.dropna(axis=1, how='all', inplace=True)
-    df_all.columns = df_all.columns.str.strip().str.lower().str.replace(" ", "_")
+    # Load sheet without assuming header
+    df = pd.read_excel(file, sheet_name="Chart of Accounts Status", header=None)
 
-    df_all['code'] = df_all['code'].astype(str)
-    df_all['currency'] = df_all['currency'].str.upper().str.strip()
-    df_all['amount'] = pd.to_numeric(df_all['amount'], errors='coerce')
+    # Dynamically find header row with 'Code' and 'Amount'
+    header_row = None
+    for i in range(min(100, len(df))):
+        row = df.iloc[i].astype(str).str.lower()
+        if any("code" in cell for cell in row.values) and any("amount" in cell for cell in row.values):
+            header_row = i
+            break
 
-    filtered = df_all[df_all['code'].isin(['240601', '110301'])].copy()
-    summary = filtered.groupby(['client_id', 'code', 'currency'])['amount'].sum().unstack(fill_value=0).reset_index()
+    if header_row is None:
+        return {"error": "Could not detect header row automatically."}, 400
 
-    results = []
+    # Reload the file from detected header
+    file.stream.seek(0)
+    df = pd.read_excel(file, sheet_name="Chart of Accounts Status", skiprows=header_row)
+    df.columns = [str(col).strip().lower().replace(" ", "_") for col in df.columns]
 
-    for (client, currency), group in summary.groupby(['client_id', 'currency']):
-        receivable = group.get(240601, 0.0) if 240601 in group else 0.0
-        order = group.get(110301, 0.0) if 110301 in group else 0.0
-        net = receivable - order
-        usd_equiv = net / 7.25 if currency == 'RMB' else 0.0
-        status = 'Neutral'
-        if currency == 'RMB':
-            if net > 0:
-                status = 'Positive'
-            elif net < 0:
-                status = 'Negative'
+    # Ensure needed columns exist
+    required_cols = ['code', 'customer/vendor_code', 'customer/vendor_name', 'amount']
+    if not all(col in df.columns for col in required_cols):
+        return {"error": f"Missing required columns in sheet: {df.columns.tolist()}"}, 400
 
-        results.append({
-            'Client ID': client,
-            'Currency': currency,
-            'Receivables': receivable,
-            'Orders': order,
-            'Net': net,
-            'USD Equivalent': usd_equiv,
-            'Status': status if currency == 'RMB' else ''
-        })
+    # Filter logic
+    df = df[
+        (df['code'].astype(str) == '240601') &
+        (~df['customer/vendor_name'].str.contains(r'\(usd\)', case=False, na=False)) &
+        (df['amount'].notna())
+    ].copy()
 
-    df_summary = pd.DataFrame(results)
-    rmb_df = df_summary[df_summary['Currency'] == 'RMB'].drop(columns=['Currency'])
-    usd_df = df_summary[df_summary['Currency'] == 'USD'][['Client ID', 'Net']].rename(columns={'Net': 'Total USD'})
-    final_df = pd.merge(rmb_df, usd_df, how='left', on='Client ID')
-    final_df = final_df[['Client ID', 'Receivables', 'Orders', 'Net', 'USD Equivalent', 'Status', 'Total USD']]
-    final_df.rename(columns={
-        'Receivables': 'Receivables (RMB)',
-        'Orders': 'Orders (RMB)',
-        'Net': 'Net RMB'
-    }, inplace=True)
-    final_df.sort_values(by='Net RMB', ascending=False, inplace=True)
+    df = df[['customer/vendor_code', 'customer/vendor_name', 'amount']].rename(columns={
+        'customer/vendor_code': 'client_id',
+        'customer/vendor_name': 'client_name',
+        'amount': 'rmb_amount'
+    }).reset_index(drop=True)
 
-    final_df.to_excel(output_path, sheet_name='Summary', index=False)
-    return send_file(output_path, as_attachment=True)
+    # Save to temporary Excel file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        output_path = tmp.name
+        df.to_excel(output_path, index=False, sheet_name="RMB_Report")
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+    # Return the file
+    return send_file(output_path, as_attachment=True, download_name="titus_cleaned_rmb.xlsx")
+
+if __name__ == "__main__":
+    app.run(debug=True)
