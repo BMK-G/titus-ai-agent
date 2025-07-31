@@ -11,7 +11,6 @@ def process_excel():
         return {"error": "No file uploaded under key 'data'"}, 400
 
     file = request.files['data']
-
     df = pd.read_excel(file, sheet_name="Chart of Accounts Status", header=None)
 
     header_row = None
@@ -51,5 +50,5 @@ def process_excel():
     return send_file(output_path, as_attachment=True, download_name="titus_cleaned_rmb.xlsx")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # Default to 5000 if PORT isn't defined
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
