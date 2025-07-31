@@ -12,10 +12,8 @@ def process_excel():
 
     file = request.files['data']
 
-    # Load sheet without assuming header
     df = pd.read_excel(file, sheet_name="Chart of Accounts Status", header=None)
 
-    # Dynamically find header row with 'Code' and 'Amount'
     header_row = None
     for i in range(min(100, len(df))):
         row = df.iloc[i].astype(str).str.lower()
@@ -26,17 +24,14 @@ def process_excel():
     if header_row is None:
         return {"error": "Could not detect header row automatically."}, 400
 
-    # Reload the file from detected header
     file.stream.seek(0)
     df = pd.read_excel(file, sheet_name="Chart of Accounts Status", skiprows=header_row)
     df.columns = [str(col).strip().lower().replace(" ", "_") for col in df.columns]
 
-    # Ensure needed columns exist
     required_cols = ['code', 'customer/vendor_code', 'customer/vendor_name', 'amount']
     if not all(col in df.columns for col in required_cols):
         return {"error": f"Missing required columns in sheet: {df.columns.tolist()}"}, 400
 
-    # Filter logic
     df = df[
         (df['code'].astype(str) == '240601') &
         (~df['customer/vendor_name'].str.contains(r'\(usd\)', case=False, na=False)) &
@@ -49,12 +44,10 @@ def process_excel():
         'amount': 'rmb_amount'
     }).reset_index(drop=True)
 
-    # Save to temporary Excel file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         output_path = tmp.name
         df.to_excel(output_path, index=False, sheet_name="RMB_Report")
 
-    # Return the file
     return send_file(output_path, as_attachment=True, download_name="titus_cleaned_rmb.xlsx")
 
 if __name__ == "__main__":
