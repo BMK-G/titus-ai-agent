@@ -49,6 +49,9 @@ def process_excel():
 
     return send_file(output_path, as_attachment=True, download_name="titus_cleaned_rmb.xlsx")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
