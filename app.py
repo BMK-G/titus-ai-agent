@@ -13,6 +13,7 @@ def process_excel():
     file = request.files['data']
     df = pd.read_excel(file, sheet_name="Chart of Accounts Status", header=None)
 
+    # Detect the header row dynamically
     header_row = None
     for i in range(min(100, len(df))):
         row = df.iloc[i].astype(str).str.lower()
@@ -27,13 +28,12 @@ def process_excel():
     df = pd.read_excel(file, sheet_name="Chart of Accounts Status", skiprows=header_row)
     df.columns = [str(col).strip().lower().replace(" ", "_") for col in df.columns]
 
-    # 👇👇👇 Debug: print detected column names 👇👇👇
-    print("Detected columns:", df.columns.tolist())
-
+    # Ensure required columns exist
     required_cols = ['code', 'customer/vendor_code', 'customer/vendor_name', 'amount']
     if not all(col in df.columns for col in required_cols):
         return {"error": f"Missing required columns in sheet: {df.columns.tolist()}"}, 400
 
+    # Filter only code 240601 and exclude USD rows
     df = df[
         (df['code'].astype(str) == '240601') &
         (~df['customer/vendor_name'].str.contains(r'\(usd\)', case=False, na=False)) &
@@ -46,16 +46,17 @@ def process_excel():
         'amount': 'rmb_amount'
     }).reset_index(drop=True)
 
+    # Write to a temporary Excel file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         output_path = tmp.name
         df.to_excel(output_path, index=False, sheet_name="RMB_Report")
 
     return send_file(output_path, as_attachment=True, download_name="titus_cleaned_rmb.xlsx")
 
-if __name__ == '__main__':
+# Run on correct port for Render
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-MB_Report")
 
     return send_file(output_path, as_attachment=True, download_name="titus_cleaned_rmb.xlsx")
 
