@@ -11,29 +11,51 @@ def process_excel():
         return {"error": "No file uploaded under key 'data'"}, 400
 
     file = request.files['data']
-    df_raw = pd.read_excel(file, sheet_name="Chart of Accounts Status", header=None)
+    df = pd.read_excel(file, sheet_name="Chart of Accounts Status", header=None)
 
-    # Extract rows that look like valid data (non-null and numeric "Amount")
-    df = df_raw.copy()
-    df.columns = range(df.shape[1])  # reset column indices just in case
+    header_row = None
+    for i in range(min(100, len(df))):
+        row = df.iloc[i].astype(str).str.lower()
+        if any("code" in cell for cell in row.values) and any("amount" in cell for cell in row.values):
+            header_row = i
+            break
 
-    # Filter out rows where 'Amount' column is numeric
-    df = df[df[6].apply(lambda x: isinstance(x, (int, float)))]
+    if header_row is None:
+        return {"error": "Could not detect header row automatically."}, 400
 
-    # Filter out USD accounts
-    df = df[~df[1].astype(str).str.contains(r'\(usd\)', case=False, na=False)]
+    file.stream.seek(0)
+    df = pd.read_excel(file, sheet_name="Chart of Accounts Status", skiprows=header_row)
+    df.columns = [str(col).strip().lower().replace(" ", "_") for col in df.columns]
 
-    # Drop rows with missing essential values
-    df = df[df[0].notna() & df[1].notna() & df[6].notna()]
+    # 👇👇👇 Debug: print detected column names 👇👇👇
+    print("Detected columns:", df.columns.tolist())
 
-    # Build final dataframe
-    df_final = df[[0, 1, 6]].copy()
-    df_final.columns = ['client_id', 'client_name', 'rmb_amount']
+    required_cols = ['code', 'customer/vendor_code', 'customer/vendor_name', 'amount']
+    if not all(col in df.columns for col in required_cols):
+        return {"error": f"Missing required columns in sheet: {df.columns.tolist()}"}, 400
 
-    # Save to Excel
+    df = df[
+        (df['code'].astype(str) == '240601') &
+        (~df['customer/vendor_name'].str.contains(r'\(usd\)', case=False, na=False)) &
+        (df['amount'].notna())
+    ].copy()
+
+    df = df[['customer/vendor_code', 'customer/vendor_name', 'amount']].rename(columns={
+        'customer/vendor_code': 'client_id',
+        'customer/vendor_name': 'client_name',
+        'amount': 'rmb_amount'
+    }).reset_index(drop=True)
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         output_path = tmp.name
-        df_final.to_excel(output_path, index=False, sheet_name="RMB_Report")
+        df.to_excel(output_path, index=False, sheet_name="RMB_Report")
+
+    return send_file(output_path, as_attachment=True, download_name="titus_cleaned_rmb.xlsx")
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+MB_Report")
 
     return send_file(output_path, as_attachment=True, download_name="titus_cleaned_rmb.xlsx")
 
