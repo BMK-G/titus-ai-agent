@@ -21,40 +21,44 @@ def process_excel():
         # Read the Excel file
         df = pd.read_excel(file, sheet_name="Chart of Accounts Status", header=None)
         
-        # Detect the header row dynamically
+        # Detect the header row dynamically - look for key identifying columns
         header_row = None
         for i in range(min(100, len(df))):
             row = df.iloc[i].astype(str).str.lower()
-            if any("code" in cell for cell in row.values) and any("amount" in cell for cell in row.values):
+            # Look for customer/vendor columns and amount - more flexible than requiring 'code'
+            if any("customer" in cell or "vendor" in cell for cell in row.values) and any("amount" in cell for cell in row.values):
                 header_row = i
                 break
         
         if header_row is None:
-            return {"error": "Could not detect header row automatically."}, 400
+            return {"error": "Could not detect header row automatically. Looking for 'customer/vendor' and 'amount' columns."}, 400
         
         # Reset file pointer and read again with proper header
         file.stream.seek(0)
         df = pd.read_excel(file, sheet_name="Chart of Accounts Status", skiprows=header_row)
         
         # Clean column names
-        df.columns = [str(col).strip().lower().replace(" ", "_") for col in df.columns]
+        df.columns = [str(col).strip().lower().replace(" ", "_").replace(".", "_") for col in df.columns]
         
-        # Ensure required columns exist
-        required_cols = ['code', 'customer/vendor_code', 'customer/vendor_name', 'amount']
+        # Check what columns we actually have for debugging
+        print(f"Available columns after cleaning: {df.columns.tolist()}")
+        
+        # More flexible column requirements - 'code' column might not exist
+        required_cols = ['customer/vendor_code', 'customer/vendor_name', 'amount']
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             return {"error": f"Missing required columns: {missing_cols}. Available columns: {df.columns.tolist()}"}, 400
         
-        # Filter data
+        # Since there's no 'code' column, we'll process all data (or you can add a different filter)
+        # Remove the code filter since it doesn't exist in your data
         df_filtered = df[
-            (df['code'].astype(str) == '240601') &
             (~df['customer/vendor_name'].str.contains(r'\(usd\)', case=False, na=False)) &
             (df['amount'].notna())
         ].copy()
         
         # Check if any data remains after filtering
         if df_filtered.empty:
-            return {"error": "No data found matching the filter criteria (code=240601, non-USD, non-null amount)"}, 400
+            return {"error": "No data found matching the filter criteria (non-USD, non-null amount)"}, 400
         
         # Select and rename columns
         result_df = df_filtered[['customer/vendor_code', 'customer/vendor_name', 'amount']].rename(columns={
