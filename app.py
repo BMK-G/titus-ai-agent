@@ -18,71 +18,152 @@ def process_excel():
         if file.filename == '':
             return {"error": "No file selected"}, 400
         
-        # Read the Excel file
+        # Read the Excel file without headers first
         df = pd.read_excel(file, sheet_name="Chart of Accounts Status", header=None)
         
-        # Detect the header row dynamically - look for key identifying columns
-        header_row = None
-        for i in range(min(100, len(df))):
-            row = df.iloc[i].astype(str).str.lower()
-            # Look for customer/vendor columns and amount - more flexible than requiring 'code'
-            if any("customer" in cell or "vendor" in cell for cell in row.values) and any("amount" in cell for cell in row.values):
-                header_row = i
-                break
+        # Process data row by row to handle the messy structure
+        data = []
         
-        if header_row is None:
-            return {"error": "Could not detect header row automatically. Looking for 'customer/vendor' and 'amount' columns."}, 400
+        for i, row in df.iterrows():
+            # Skip empty rows
+            if row.isna().all():
+                continue
+                
+            # Column A should contain the code
+            code = str(row[0]).strip() if pd.notna(row[0]) else ""
+            
+            # Only process codes 240601 (receivables) and 110301 (orders)
+            if code not in ['240601', '110301']:
+                continue
+            
+            # Column B should contain client name/ID
+            client_info = str(row[1]).strip() if pd.notna(row[1]) else ""
+            if not client_info or client_info.lower() in ['nan', 'none', '']:
+                continue
+            
+            # First check for USD to avoid misclassification
+            if 'usd' in client_info.lower() or '(usd)' in client_info.lower():
+                continue  # Skip USD clients entirely
+            
+            # Detect if this is an RMB client
+            is_rmb_client = False
+            client_id = client_info
+            client_name = client_info
+            
+            # Method 1: Check for (RMB) in the name/code
+            if '(rmb)' in client_info.lower():
+                is_rmb_client = True
+                client_id = client_info.replace('(RMB)', '').replace('(rmb)', '').strip()
+                client_name = client_id.replace('RMB', '').strip()  # Even cleaner for display
+            
+            # Method 2: Check if client code ends with RMB (like JKMRMB)
+            elif client_info.lower().endswith('rmb'):
+                is_rmb_client = True
+                client_id = client_info  # Keep as is for codes like JKMRMB
+                client_name = client_info.replace('RMB', '').strip()  # Remove RMB for cleaner display
+            
+            # Method 3: Contains 'rmb' but be more specific to avoid false positives
+            elif 'rmb' in client_info.lower() and len(client_info) <= 10:  # Likely a code, not a description
+                is_rmb_client = True
+            
+            # Skip non-RMB clients
+            if not is_rmb_client:
+                continue
+            
+            # Find the amount - prioritize column G (index 6) if it exists
+            amount = None
+            
+            # First try column G (common location for amounts)
+            if len(row) > 6 and pd.notna(row[6]) and isinstance(row[6], (int, float)) and row[6] != 0:
+                amount = float(row[6])
+            else:
+                # Fallback: scan all columns after B for the first valid amount
+                for j in range(2, len(row)):
+                    cell_value = row[j]
+                    if pd.notna(cell_value) and isinstance(cell_value, (int, float)) and cell_value != 0:
+                        amount = float(cell_value)
+                        break
+            
+            # Skip if no valid amount found
+            if amount is None:
+                continue
+            
+            # Add to data
+            data.append({
+                'client_id': client_id,
+                'client_name': client_id,  # Using same value for both
+                'code': code,
+                'amount': amount,
+                'type': 'receivables' if code == '240601' else 'orders'
+            })
         
-        # Reset file pointer and read again with proper header
-        file.stream.seek(0)
-        df = pd.read_excel(file, sheet_name="Chart of Accounts Status", skiprows=header_row)
+        # Check if we found any data
+        if not data:
+            return {"error": "No valid RMB entries found with codes 240601 or 110301"}, 400
         
-        # Clean column names
-        df.columns = [str(col).strip().lower().replace(" ", "_").replace(".", "_") for col in df.columns]
+        # Convert to DataFrame
+        df_data = pd.DataFrame(data)
         
-        # Check what columns we actually have for debugging
-        print(f"Available columns after cleaning: {df.columns.tolist()}")
+        # Group by client and pivot to get receivables and orders
+        pivot = df_data.pivot_table(
+            index=['client_id', 'client_name'], 
+            columns='type', 
+            values='amount', 
+            aggfunc='sum'
+        ).fillna(0)
         
-        # More flexible column requirements - 'code' column might not exist
-        required_cols = ['customer/vendor_code', 'customer/vendor_name', 'amount']
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        if missing_cols:
-            return {"error": f"Missing required columns: {missing_cols}. Available columns: {df.columns.tolist()}"}, 400
+        # Reset index to make client_id and client_name regular columns
+        result = pivot.reset_index()
         
-        # Since there's no 'code' column, we'll process all data (or you can add a different filter)
-        # Remove the code filter since it doesn't exist in your data
-        df_filtered = df[
-            (~df['customer/vendor_name'].str.contains(r'\(usd\)', case=False, na=False)) &
-            (df['amount'].notna())
-        ].copy()
+        # Ensure we have both receivables and orders columns
+        if 'receivables' not in result.columns:
+            result['receivables'] = 0
+        if 'orders' not in result.columns:
+            result['orders'] = 0
         
-        # Check if any data remains after filtering
-        if df_filtered.empty:
-            return {"error": "No data found matching the filter criteria (non-USD, non-null amount)"}, 400
+        # Calculate net RMB amount
+        result['rmb_amount'] = result['receivables'] - result['orders']
         
-        # Select and rename columns
-        result_df = df_filtered[['customer/vendor_code', 'customer/vendor_name', 'amount']].rename(columns={
-            'customer/vendor_code': 'client_id',
-            'customer/vendor_name': 'client_name',
-            'amount': 'rmb_amount'
-        }).reset_index(drop=True)
+        # Select and order final columns
+        final_result = result[['client_id', 'client_name', 'receivables', 'orders', 'rmb_amount']].copy()
+        
+        # Get user preference for filtering (default: only clients with both)
+        only_full = request.args.get('only_full', 'true').lower() == 'true'
+        
+        if only_full:
+            # Only include clients who appear in BOTH receivables AND orders
+            final_result = final_result[
+                (final_result['receivables'] > 0) & (final_result['orders'] > 0)
+            ].reset_index(drop=True)
+            error_msg = "No clients found with both receivables AND orders data"
+        else:
+            # Include clients with either receivables OR orders
+            final_result = final_result[
+                (final_result['receivables'] != 0) | (final_result['orders'] != 0)
+            ].reset_index(drop=True)
+            error_msg = "No clients found with receivables or orders data"
+        
+        if final_result.empty:
+            return {"error": error_msg}, 400
+        
+        # Rename columns to match professional format
+        final_result.rename(columns={
+            'client_id': 'Client Code',
+            'client_name': 'Client Name', 
+            'receivables': 'Receivables (RMB)',
+            'orders': 'Orders (RMB)',
+            'rmb_amount': 'Net Receivable'
+        }, inplace=True)
         
         # Create temporary file and write Excel
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
             output_path = tmp.name
-            result_df.to_excel(output_path, index=False, sheet_name="RMB_Report")
-        
-        # Clean up the temp file after sending (optional but good practice)
-        def cleanup_file():
-            try:
-                os.unlink(output_path)
-            except:
-                pass
+            final_result.to_excel(output_path, index=False, sheet_name="RMB_Report")
         
         return send_file(
             output_path, 
             as_attachment=True, 
-            download_name="titus_cleaned_rmb.xlsx",
+            download_name="titus_excel_cleaned_rmb.xlsx",
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
         
@@ -91,7 +172,7 @@ def process_excel():
     except Exception as e:
         return {"error": f"An error occurred: {str(e)}"}, 500
 
-# Health check endpoint (good practice for deployment)
+# Health check endpoint
 @app.route("/health", methods=["GET"])
 def health_check():
     return {"status": "healthy"}, 200
