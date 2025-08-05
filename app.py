@@ -17,31 +17,28 @@ def process_excel():
 
         df = pd.read_excel(file, sheet_name="Chart of Accounts Status", header=None)
         data = []
-        debug_info = {
-            'total_rows': len(df),
-            'codes_found': set(),
-            'client_info_samples': [],
-            'rmb_clients_found': 0,
-            'valid_entries': 0
-        }
+        current_code = None
 
         for i, row in df.iterrows():
+            # Skip empty rows
             if row.isna().all():
                 continue
 
-            code = str(row[0]).strip() if pd.notna(row[0]) else ""
-            if code and code != 'nan':
-                debug_info['codes_found'].add(code)
+            # Detect a title row with only 240601 or 110301
+            values = row.dropna().astype(str).str.strip().tolist()
+            if len(values) == 1 and values[0] in ['240601', '110301']:
+                current_code = values[0]
+                continue
+
+            # If not under a valid section, skip
+            if current_code not in ['240601', '110301']:
+                continue
 
             client_info = str(row[1]).strip() if pd.notna(row[1]) else ""
-            if client_info and client_info != 'nan' and len(debug_info['client_info_samples']) < 10:
-                debug_info['client_info_samples'].append(f"Row {i}: '{client_info}'")
-
-            if code not in ['240601', '110301']:
-                continue
             if not client_info or client_info.lower() in ['nan', 'none', '']:
                 continue
 
+            # Skip pure USD clients
             if 'usd' in client_info.lower() and 'rmb' not in client_info.lower():
                 continue
 
@@ -63,9 +60,8 @@ def process_excel():
             if not is_rmb_client:
                 continue
 
-            debug_info['rmb_clients_found'] += 1
+            # Find amount: prioritize column G (index 6) but fallback to any valid number
             amount = None
-
             if len(row) > 6 and pd.notna(row[6]) and isinstance(row[6], (int, float)) and row[6] != 0:
                 amount = float(row[6])
             else:
@@ -78,67 +74,48 @@ def process_excel():
             if amount is None:
                 continue
 
-            debug_info['valid_entries'] += 1
-
             data.append({
                 'client_id': client_id,
-                'client_name': client_id,
-                'code': code,
+                'client_name': client_name,
+                'code': current_code,
                 'amount': amount,
-                'type': 'receivables' if code == '240601' else 'orders'
+                'type': 'receivables' if current_code == '240601' else 'orders'
             })
 
         if not data:
-            return {
-                "error": "No valid RMB entries found with codes 240601 or 110301",
-                "debug": {
-                    "total_rows_processed": debug_info['total_rows'],
-                    "codes_found_in_column_A": list(debug_info['codes_found'])[:20],
-                    "client_info_samples": debug_info['client_info_samples'],
-                    "rmb_clients_found": debug_info['rmb_clients_found'],
-                    "valid_entries_with_amounts": debug_info['valid_entries']
-                }
-            }, 400
+            return {"error": "No valid RMB entries found."}, 400
 
         df_data = pd.DataFrame(data)
-
         pivot = df_data.pivot_table(
-            index=['client_id', 'client_name'], 
-            columns='type', 
-            values='amount', 
+            index=['client_id', 'client_name'],
+            columns='type',
+            values='amount',
             aggfunc='sum'
-        ).fillna(0)
+        ).fillna(0).reset_index()
 
-        result = pivot.reset_index()
+        if 'receivables' not in pivot.columns:
+            pivot['receivables'] = 0
+        if 'orders' not in pivot.columns:
+            pivot['orders'] = 0
 
-        if 'receivables' not in result.columns:
-            result['receivables'] = 0
-        if 'orders' not in result.columns:
-            result['orders'] = 0
+        pivot['rmb_amount'] = pivot['receivables'] - pivot['orders']
 
-        result['rmb_amount'] = result['receivables'] - result['orders']
-
-        final_result = result[['client_id', 'client_name', 'receivables', 'orders', 'rmb_amount']].copy()
-
+        result = pivot[['client_id', 'client_name', 'receivables', 'orders', 'rmb_amount']]
         only_full = request.args.get('only_full', 'true').lower() == 'true'
 
         if only_full:
-            final_result = final_result[
-                (final_result['receivables'] > 0) & (final_result['orders'] > 0)
-            ].reset_index(drop=True)
-            error_msg = "No clients found with both receivables AND orders data"
+            result = result[(result['receivables'] > 0) & (result['orders'] > 0)].reset_index(drop=True)
+            error_msg = "No clients found with both receivables AND orders"
         else:
-            final_result = final_result[
-                (final_result['receivables'] != 0) | (final_result['orders'] != 0)
-            ].reset_index(drop=True)
-            error_msg = "No clients found with receivables or orders data"
+            result = result[(result['receivables'] != 0) | (result['orders'] != 0)].reset_index(drop=True)
+            error_msg = "No clients found with receivables or orders"
 
-        if final_result.empty:
+        if result.empty:
             return {"error": error_msg}, 400
 
-        final_result.rename(columns={
+        result.rename(columns={
             'client_id': 'Client Code',
-            'client_name': 'Client Name', 
+            'client_name': 'Client Name',
             'receivables': 'Receivables (RMB)',
             'orders': 'Orders (RMB)',
             'rmb_amount': 'Net Receivable'
@@ -146,24 +123,27 @@ def process_excel():
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
             output_path = tmp.name
-            final_result.to_excel(output_path, index=False, sheet_name="RMB_Report")
+            result.to_excel(output_path, index=False, sheet_name="RMB_Report")
 
         return send_file(
-            output_path, 
-            as_attachment=True, 
+            output_path,
+            as_attachment=True,
             download_name="titus_excel_cleaned_rmb.xlsx",
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
 
     except FileNotFoundError:
-        return {"error": "Sheet 'Chart of Accounts Status' not found in the uploaded file"}, 400
+        return {"error": "Sheet 'Chart of Accounts Status' not found"}, 400
     except Exception as e:
         return {"error": f"An error occurred: {str(e)}"}, 500
-
 
 @app.route("/health", methods=["GET"])
 def health_check():
     return {"status": "healthy"}, 200
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False)
 
 
 if __name__ == "__main__":
