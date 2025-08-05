@@ -10,7 +10,7 @@ def process_excel():
     try:
         if 'data' not in request.files:
             return {"error": "No file uploaded under key 'data'"}, 400
-        
+
         file = request.files['data']
         if file.filename == '':
             return {"error": "No file selected"}, 400
@@ -170,8 +170,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
 
-    return {"status": "healthy"}, 200
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
