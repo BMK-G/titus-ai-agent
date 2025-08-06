@@ -5,7 +5,6 @@ import os
 import re
 import logging
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -126,7 +125,10 @@ def process_excel():
             pivot[col] = 0
         pivot = pivot.reset_index()
 
-        pivot['usd_equivalent'] = (pivot['orders'] / 7.10).round(2)
+        # ➕ NEW: Add total column and USD equivalent
+        pivot['total'] = (pivot['receivables'] - pivot['orders']).round(2)
+        pivot['usd_equivalent'] = (pivot['total'] / 7.10).round(2)
+
         pivot['credit_limit'] = pivot['client_name'].map(credit_limits)
         pivot['credit_limit'] = pivot['credit_limit'].apply(lambda x: f"{x:.2f}" if pd.notna(x) and x != 0 else "")
 
@@ -151,6 +153,7 @@ def process_excel():
             'client_name': 'Client Name',
             'receivables': 'Receivables (RMB)',
             'orders': 'Orders (RMB)',
+            'total': 'Total (RMB)',  # ✅ NEW COLUMN
             'usd_equivalent': 'USD Equivalent',
             'credit_limit': 'Credit Limit'
         }
@@ -164,7 +167,7 @@ def process_excel():
                 workbook = writer.book
                 worksheet = writer.sheets['RMB_Report']
                 currency_format = workbook.add_format({'num_format': '#,##0.00'})
-                worksheet.set_column('C:E', 12, currency_format)
+                worksheet.set_column('C:F', 14, currency_format)  # Currency columns
 
         return send_file(
             output_path,
@@ -184,3 +187,8 @@ def health_check():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False)
+
