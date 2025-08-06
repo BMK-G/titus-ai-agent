@@ -58,15 +58,16 @@ def process_excel():
             else:
                 continue
 
-            numeric_cols = row[2:].select_dtypes(include=['number'])
-            if numeric_cols.empty:
+            # ✅ FIXED: Proper numeric extraction from Series
+            amount = None
+            for val in row[2:]:
+                if pd.notna(val) and isinstance(val, (int, float)) and val != 0:
+                    amount = float(val)
+                    break
+
+            if amount is None:
                 continue
 
-            non_zero_amounts = numeric_cols[numeric_cols != 0]
-            if non_zero_amounts.empty:
-                continue
-
-            amount = float(non_zero_amounts.iloc[0])
             code = str(row[0]).strip() if pd.notna(row[0]) else "Unknown"
 
             data.append({
@@ -108,7 +109,7 @@ def process_excel():
             return {"error": error_msg}, 400
 
         # ✅ Console debug log (summary of results)
-        print(f"✅ Processed {len(result)} RMB clients. Receivables: {result['Receivables (RMB)'].sum():.2f}, Orders: {result['Orders (RMB)'].sum():.2f}")
+        print(f"✅ Processed {len(result)} RMB clients. Receivables: {result['receivables'].sum():.2f}, Orders: {result['orders'].sum():.2f}")
 
         # 7. Select and rename columns
         result = result[['client_id', 'client_name', 'receivables', 'orders', 'usd_equivalent', 'credit_limit']].rename(columns={
