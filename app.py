@@ -20,50 +20,53 @@ def process_excel():
         except:
             df = pd.read_excel(file, sheet_name=0, header=None)
 
+        # 2. Pre-filter rows to reduce iterations
+        df = df.dropna(how='all').reset_index(drop=True)
+
+        col_b_str = df[1].astype(str).str.strip().str.lower()
+
+        rmb_mask = (
+            col_b_str.str.contains('rmb', na=False) | 
+            col_b_str.str.contains(r'\(rmb\)', na=False)
+        )
+        usd_only_mask = (
+            col_b_str.str.contains('usd', na=False) & 
+            ~col_b_str.str.contains('rmb', na=False)
+        )
+
+        candidate_rows = df[rmb_mask & ~usd_only_mask]
+
         data = []
 
-        # 2. Iterate rows and extract RMB clients
-        for _, row in df.iterrows():
-            if row.isna().all():
+        # 3. Iterate only candidate rows
+        for idx, row in candidate_rows.iterrows():
+            client_info = str(row[1]).strip()
+            if not client_info or client_info.lower() == 'nan':
                 continue
 
-            client_info = str(row[1]).strip() if pd.notna(row[1]) else ""
-            if not client_info:
-                continue
+            client_info_lower = client_info.lower()
 
-            if 'usd' in client_info.lower() and 'rmb' not in client_info.lower():
-                continue  # skip USD-only clients
-
-            # Detect RMB client
-            is_rmb_client = False
-            if '(rmb)' in client_info.lower():
-                is_rmb_client = True
+            if '(rmb)' in client_info_lower:
                 client_id = client_info.replace('(RMB)', '').replace('(rmb)', '').strip()
                 client_name = client_id.replace('RMB', '').strip()
-            elif client_info.lower().endswith('rmb'):
-                is_rmb_client = True
+            elif client_info_lower.endswith('rmb'):
                 client_id = client_info.strip()
                 client_name = client_id.replace('RMB', '').strip()
-            elif 'rmb' in client_info.lower() and len(client_info) <= 10:
-                is_rmb_client = True
+            elif 'rmb' in client_info_lower and len(client_info) <= 10:
                 client_id = client_info
                 client_name = client_info
-
-            if not is_rmb_client:
+            else:
                 continue
 
-            # Extract amount from column C onward
-            amount = None
-            for j in range(2, len(row)):
-                val = row[j]
-                if pd.notna(val) and isinstance(val, (int, float)) and val != 0:
-                    amount = float(val)
-                    break
-
-            if amount is None:
+            numeric_cols = row[2:].select_dtypes(include=['number'])
+            if numeric_cols.empty:
                 continue
 
-            # Use column A as the code (SARMB, 240601, etc.)
+            non_zero_amounts = numeric_cols[numeric_cols != 0]
+            if non_zero_amounts.empty:
+                continue
+
+            amount = float(non_zero_amounts.iloc[0])
             code = str(row[0]).strip() if pd.notna(row[0]) else "Unknown"
 
             data.append({
@@ -77,45 +80,51 @@ def process_excel():
         if not data:
             return {"error": "No valid RMB entries found."}, 400
 
-        # 3. Pivot & compute totals
+        # 4. Optimized pivot with single operation
         df_data = pd.DataFrame(data)
-        pivot = df_data.pivot_table(
-            index=['client_id', 'client_name'],
-            columns='type',
-            values='amount',
-            aggfunc='sum'
-        ).fillna(0).reset_index()
 
-        pivot['receivables'] = pivot.get('receivables', 0)
-        pivot['orders'] = pivot.get('orders', 0)
-        pivot['rmb_amount'] = pivot['receivables'] - pivot['orders']
+        pivot = df_data.groupby(['client_id', 'client_name', 'type'])['amount'].sum().unstack(fill_value=0).reset_index()
 
-        result = pivot[['client_id', 'client_name', 'receivables', 'orders', 'rmb_amount']]
+        for col in ['receivables', 'orders']:
+            if col not in pivot.columns:
+                pivot[col] = 0
 
-        # 4. Filter based on query param
+        # 5. Vectorized calculations
+        pivot['usd_equivalent'] = (pivot['orders'] / 7.10).round(2)
+        pivot['credit_limit'] = ""
+        pivot['credit_limit'] = pivot['credit_limit'].astype(str)
+
+        # 6. Single filtering operation
         only_full = request.args.get('only_full', 'true').lower() == 'true'
-        if only_full:
-            result = result[(result['receivables'] > 0) & (result['orders'] > 0)]
-            if result.empty:
-                return {"error": "No clients found with both receivables AND orders"}, 400
-        else:
-            result = result[(result['receivables'] != 0) | (result['orders'] != 0)]
-            if result.empty:
-                return {"error": "No clients found with receivables or orders"}, 400
 
-        # 5. Rename columns
-        result.rename(columns={
+        if only_full:
+            result = pivot[(pivot['receivables'] > 0) & (pivot['orders'] > 0)].copy()
+            error_msg = "No clients found with both receivables AND orders"
+        else:
+            result = pivot[(pivot['receivables'] != 0) | (pivot['orders'] != 0)].copy()
+            error_msg = "No clients found with receivables or orders"
+
+        if result.empty:
+            return {"error": error_msg}, 400
+
+        # ✅ Console debug log (summary of results)
+        print(f"✅ Processed {len(result)} RMB clients. Receivables: {result['Receivables (RMB)'].sum():.2f}, Orders: {result['Orders (RMB)'].sum():.2f}")
+
+        # 7. Select and rename columns
+        result = result[['client_id', 'client_name', 'receivables', 'orders', 'usd_equivalent', 'credit_limit']].rename(columns={
             'client_id': 'Client Code',
             'client_name': 'Client Name',
             'receivables': 'Receivables (RMB)',
             'orders': 'Orders (RMB)',
-            'rmb_amount': 'Net Receivable'
-        }, inplace=True)
+            'usd_equivalent': 'USD Equivalent',
+            'credit_limit': 'Credit Limit'
+        })
 
-        # 6. Write to Excel file
+        # 8. Excel writing
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
             output_path = tmp.name
-            result.to_excel(output_path, index=False, sheet_name="RMB_Report", engine="xlsxwriter")
+            with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+                result.to_excel(writer, sheet_name="RMB_Report", index=False)
 
         return send_file(
             output_path,
