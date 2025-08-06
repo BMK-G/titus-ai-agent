@@ -13,34 +13,28 @@ def process_excel():
             return {"error": "No valid file uploaded under key 'data'"}, 400
 
         file = request.files['data']
-        df = pd.read_excel(file, sheet_name="Chart of Accounts Status", header=None)
+
+        # Try reading specific sheet first, fallback to first sheet
+        try:
+            df = pd.read_excel(file, sheet_name="Chart of Accounts Status", header=None)
+        except:
+            df = pd.read_excel(file, sheet_name=0, header=None)
 
         data = []
-        current_code = None
 
-        # 2. Parse and extract data based on section titles (240601 or 110301)
+        # 2. Iterate rows and extract RMB clients
         for _, row in df.iterrows():
             if row.isna().all():
                 continue
 
-            # Detect section headers like "240601"
-            non_na_values = row.dropna().astype(str).str.strip().tolist()
-            if len(non_na_values) == 1 and non_na_values[0] in ['240601', '110301']:
-                current_code = non_na_values[0]
-                continue
-
-            if current_code not in ['240601', '110301']:
-                continue
-
-            # Extract and clean client info
             client_info = str(row[1]).strip() if pd.notna(row[1]) else ""
-            if not client_info or client_info.lower() in ['nan', 'none']:
+            if not client_info:
                 continue
 
             if 'usd' in client_info.lower() and 'rmb' not in client_info.lower():
-                continue  # USD client, skip
+                continue  # skip USD-only clients
 
-            # Detect RMB clients
+            # Detect RMB client
             is_rmb_client = False
             if '(rmb)' in client_info.lower():
                 is_rmb_client = True
@@ -58,7 +52,7 @@ def process_excel():
             if not is_rmb_client:
                 continue
 
-            # Extract amount (search from column C onward)
+            # Extract amount from column C onward
             amount = None
             for j in range(2, len(row)):
                 val = row[j]
@@ -69,18 +63,21 @@ def process_excel():
             if amount is None:
                 continue
 
+            # Use column A as the code (SARMB, 240601, etc.)
+            code = str(row[0]).strip() if pd.notna(row[0]) else "Unknown"
+
             data.append({
                 'client_id': client_id,
                 'client_name': client_name,
-                'code': current_code,
+                'code': code,
                 'amount': amount,
-                'type': 'receivables' if current_code == '240601' else 'orders'
+                'type': 'receivables' if code == '240601' else 'orders'
             })
 
         if not data:
             return {"error": "No valid RMB entries found."}, 400
 
-        # 3. Pivot and compute totals
+        # 3. Pivot & compute totals
         df_data = pd.DataFrame(data)
         pivot = df_data.pivot_table(
             index=['client_id', 'client_name'],
@@ -127,8 +124,6 @@ def process_excel():
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
 
-    except FileNotFoundError:
-        return {"error": "Sheet 'Chart of Accounts Status' not found"}, 400
     except Exception as e:
         return {"error": f"An error occurred: {str(e)}"}, 500
 
