@@ -58,16 +58,13 @@ def process_excel():
             if not is_rmb_client:
                 continue
 
-            # Extract amount (prefer column G, then fallback)
+            # Extract amount (search from column C onward)
             amount = None
-            if len(row) > 6 and pd.notna(row[6]) and isinstance(row[6], (int, float)) and row[6] != 0:
-                amount = float(row[6])
-            else:
-                for j in range(2, len(row)):
-                    val = row[j]
-                    if pd.notna(val) and isinstance(val, (int, float)) and val != 0:
-                        amount = float(val)
-                        break
+            for j in range(2, len(row)):
+                val = row[j]
+                if pd.notna(val) and isinstance(val, (int, float)) and val != 0:
+                    amount = float(val)
+                    break
 
             if amount is None:
                 continue
@@ -121,7 +118,7 @@ def process_excel():
         # 6. Write to Excel file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
             output_path = tmp.name
-            result.to_excel(output_path, index=False, sheet_name="RMB_Report")
+            result.to_excel(output_path, index=False, sheet_name="RMB_Report", engine="xlsxwriter")
 
         return send_file(
             output_path,
@@ -144,9 +141,3 @@ def health_check():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
-
