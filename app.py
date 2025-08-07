@@ -44,7 +44,7 @@ class ClientData:
 class ExcelProcessor:
     def __init__(self, df: pd.DataFrame):
         self.df = df
-        self.df_str = df.astype(str).str.lower().str.strip()
+        self.df_str = df.astype(str).applymap(lambda x: str(x).strip().lower())
         self.stats = ProcessingStats()
         
     def find_section_indices(self, code: str) -> pd.Index:
@@ -240,3 +240,4 @@ def process_excel():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
