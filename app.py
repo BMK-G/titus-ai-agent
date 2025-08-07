@@ -4,230 +4,310 @@ import tempfile
 import os
 import re
 import logging
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from contextlib import contextmanager
+import io
 
-# Configure logging for production
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),  # Console output
-        logging.FileHandler('rmb_processing.log')  # File output
+        logging.StreamHandler(),
+        logging.FileHandler('rmb_processing.log')
     ]
 )
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# Constants
+SECTION_CODES = {'receivables': '240601', 'orders': '110301'}
+EXCHANGE_RATE = 7.10
+DEFAULT_SHEET = "Chart of Accounts Status"
+FILE_KEY = 'data'
+
+@dataclass
+class ProcessingStats:
+    no_rmb: int = 0
+    no_amount: int = 0
+    invalid_client: int = 0
+
+@dataclass
+class ClientData:
+    client_id: str
+    client_name: str
+    code: str
+    amount: float
+    type: str
+
+class ExcelProcessor:
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+        self.df_str = df.astype(str).str.lower().str.strip()
+        self.stats = ProcessingStats()
+        
+    def find_section_indices(self, code: str) -> pd.Index:
+        """Find all rows containing the specified section code."""
+        joined = self.df_str.apply(lambda row: ' '.join(row), axis=1)
+        return self.df[joined.str.contains(code, na=False)].index
+    
+    def extract_amount(self, row: pd.Series) -> Optional[float]:
+        """Extract the first non-zero numeric value from row columns 2+."""
+        try:
+            numeric_vals = pd.to_numeric(row.iloc[2:], errors='coerce')
+            non_zero = numeric_vals[numeric_vals != 0].dropna()
+            return float(non_zero.iloc[0]) if len(non_zero) > 0 else None
+        except (IndexError, ValueError):
+            return None
+    
+    def clean_client_info(self, client_info: str) -> Tuple[str, str]:
+        """Clean and extract client ID and name from client info."""
+        client_info = client_info.strip()
+        client_id = re.sub(r'\(rmb\)', '', client_info, flags=re.IGNORECASE).strip()
+        client_name = re.sub(r'rmb', '', client_id, flags=re.IGNORECASE).strip()
+        return client_id, client_name
+    
+    def process_section(self, section_type: str, start_indices: pd.Index) -> List[ClientData]:
+        """Process a specific section (receivables or orders) and extract client data."""
+        data = []
+        code = SECTION_CODES[section_type]
+        
+        for start_idx in start_indices:
+            # Find section boundaries
+            remaining_df = self.df_str.iloc[start_idx + 1:]
+            next_section_mask = remaining_df.apply(
+                lambda row: any(section_code in ' '.join(row) 
+                              for section_code in SECTION_CODES.values()), axis=1
+            )
+            end_idx = next_section_mask.idxmax() if next_section_mask.any() else len(self.df)
+            section_data = self.df.iloc[start_idx + 1:end_idx]
+            
+            # Filter rows with RMB
+            rmb_mask = section_data.iloc[:, 1].astype(str).str.lower().str.contains('rmb', na=False)
+            rmb_rows = section_data[rmb_mask]
+            self.stats.no_rmb += len(section_data) - len(rmb_rows)
+            
+            # Process each RMB row
+            for idx, row in rmb_rows.iterrows():
+                client_info = str(row.iloc[1]).strip()
+                
+                # Validate client info
+                if not client_info or client_info.lower() == 'nan':
+                    self.stats.invalid_client += 1
+                    continue
+                
+                # Extract amount
+                amount = self.extract_amount(row)
+                if amount is None or amount == 0:
+                    self.stats.no_amount += 1
+                    continue
+                
+                # Clean client data
+                client_id, client_name = self.clean_client_info(client_info)
+                
+                data.append(ClientData(
+                    client_id=client_id,
+                    client_name=client_name,
+                    code=code,
+                    amount=amount,
+                    type=section_type
+                ))
+        
+        return data
+    
+    def extract_credit_limits(self) -> Dict[str, float]:
+        """Extract credit limits from the Excel file."""
+        credit_limits = {}
+        
+        # Find rows containing "credit limit"
+        credit_mask = self.df_str.apply(
+            lambda row: any('credit limit' in cell for cell in row), axis=1
+        )
+        credit_rows = self.df[credit_mask]
+        
+        for _, row in credit_rows.iterrows():
+            try:
+                potential_name = str(row.iloc[1]).strip()
+                if 'rmb' not in potential_name.lower():
+                    continue
+                
+                cleaned_name = re.sub(r'rmb|\(rmb\)', '', potential_name, flags=re.IGNORECASE).strip()
+                amount = self.extract_amount(row)
+                
+                if amount is not None and amount > 0:
+                    credit_limits[cleaned_name] = amount
+            except Exception as e:
+                logger.warning(f"Credit limit extraction failed: {e}")
+        
+        return credit_limits
+    
+    def process(self) -> Tuple[List[ClientData], Dict[str, float], ProcessingStats]:
+        """Main processing method."""
+        all_data = []
+        
+        # Process each section type
+        for section_type in SECTION_CODES:
+            indices = self.find_section_indices(SECTION_CODES[section_type])
+            section_data = self.process_section(section_type, indices)
+            all_data.extend(section_data)
+        
+        # Extract credit limits
+        credit_limits = self.extract_credit_limits()
+        
+        return all_data, credit_limits, self.stats
+
+@contextmanager
+def create_temp_excel(result_df: pd.DataFrame):
+    """Context manager for creating temporary Excel files."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        output_path = tmp.name
+        
+    try:
+        # Create Excel with formatting
+        with pd.ExcelWriter(output_path, engine="xlsxwriter", 
+                          options={'strings_to_numbers': True}) as writer:
+            result_df.to_excel(writer, sheet_name="RMB_Report", index=False)
+            
+            # Apply formatting
+            workbook = writer.book
+            worksheet = writer.sheets['RMB_Report']
+            currency_format = workbook.add_format({'num_format': '#,##0.00'})
+            worksheet.set_column('C:E', 12, currency_format)
+        
+        yield output_path
+    finally:
+        # Clean up temp file
+        if os.path.exists(output_path):
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+
+def load_excel_file(file) -> pd.DataFrame:
+    """Load Excel file with fallback logic."""
+    try:
+        return pd.read_excel(file, sheet_name=DEFAULT_SHEET, header=None)
+    except Exception:
+        logger.info(f"Sheet '{DEFAULT_SHEET}' not found, using first sheet")
+        return pd.read_excel(file, sheet_name=0, header=None)
+
+def create_result_dataframe(data: List[ClientData], credit_limits: Dict[str, float], 
+                          only_full: bool = True) -> pd.DataFrame:
+    """Create the final result DataFrame with proper formatting."""
+    if not data:
+        raise ValueError("No valid data found")
+    
+    # Convert to DataFrame
+    df_data = pd.DataFrame([
+        {
+            'client_id': item.client_id,
+            'client_name': item.client_name,
+            'type': item.type,
+            'amount': item.amount
+        } for item in data
+    ])
+    
+    # Pivot and aggregate
+    pivot = (df_data.groupby(['client_id', 'client_name', 'type'])['amount']
+             .sum()
+             .unstack(fill_value=0)
+             .reset_index())
+    
+    # Ensure required columns exist
+    for col in ['receivables', 'orders']:
+        if col not in pivot.columns:
+            pivot[col] = 0
+    
+    # Calculate derived columns
+    pivot['usd_equivalent'] = (pivot['orders'] / EXCHANGE_RATE).round(2)
+    pivot['credit_limit'] = pivot['client_name'].map(credit_limits).fillna('')
+    pivot['credit_limit'] = pivot['credit_limit'].apply(
+        lambda x: f"{x:.2f}" if pd.notna(x) and x != 0 else ""
+    )
+    
+    # Apply filtering
+    if only_full:
+        result = pivot[(pivot['receivables'] > 0) & (pivot['orders'] > 0)]
+    else:
+        result = pivot[(pivot['receivables'] != 0) | (pivot['orders'] != 0)]
+    
+    if result.empty:
+        raise ValueError("No clients found matching criteria")
+    
+    # Rename columns for output
+    column_mapping = {
+        'client_id': 'Client Code',
+        'client_name': 'Client Name',
+        'receivables': 'Receivables (RMB)',
+        'orders': 'Orders (RMB)',
+        'usd_equivalent': 'USD Equivalent',
+        'credit_limit': 'Credit Limit'
+    }
+    
+    return result[list(column_mapping.keys())].rename(columns=column_mapping)
+
+# Flask Routes
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({
+        "message": "✅ Titus AI Agent is running. Use the /process route (POST) to upload Excel files."
+    }), 200
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
+
 @app.route("/process", methods=["POST"])
 def process_excel():
     try:
-        if 'data' not in request.files or request.files['data'].filename == '':
-            return {"error": "No valid file uploaded under key 'data'"}, 400
+        # Validate file upload
+        if FILE_KEY not in request.files or request.files[FILE_KEY].filename == '':
+            return jsonify({"error": f"No valid file uploaded under key '{FILE_KEY}'"}), 400
 
-        file = request.files['data']
-
-        # Try loading the correct sheet
-        try:
-            df = pd.read_excel(file, sheet_name="Chart of Accounts Status", header=None)
-        except:
-            df = pd.read_excel(file, sheet_name=0, header=None)
-
-        # Remove empty rows and convert to string for processing
+        file = request.files[FILE_KEY]
+        
+        # Load and clean DataFrame
+        df = load_excel_file(file)
         df = df.dropna(how='all').reset_index(drop=True)
         
-        # Pre-compute string representations for efficiency
-        df_str = df.astype(str).apply(lambda x: x.str.lower().str.strip())
+        # Process the Excel file
+        processor = ExcelProcessor(df)
+        data, credit_limits, stats = processor.process()
         
-        # Vectorized section detection (cached for efficiency)
-        df_joined = df_str.apply(lambda row: ' '.join(row), axis=1)
-        section_240601 = df_joined.str.contains('240601', na=False)
-        section_110301 = df_joined.str.contains('110301', na=False)
-        
-        # Find section boundaries
-        receivables_start = df[section_240601].index
-        orders_start = df[section_110301].index
-        
-        data = []
-        credit_limits = {}
-        skipped_rows = {'no_rmb': 0, 'no_amount': 0, 'invalid_client': 0}
-        
-        # Process sections efficiently with dynamic boundaries
-        for section_type, section_indices in [('receivables', receivables_start), ('orders', orders_start)]:
-            for start_idx in section_indices:
-                # Smart section boundary detection
-                remaining_df = df_str.iloc[start_idx+1:]
-                next_section_mask = remaining_df.apply(
-                    lambda row: any(code in ' '.join(row) for code in ['240601', '110301']), 
-                    axis=1
-                )
-                
-                if next_section_mask.any():
-                    end_idx = next_section_mask.idxmax()
-                else:
-                    end_idx = len(df)
-                
-                section_data = df.iloc[start_idx+1:end_idx]
-                logger.info(f"Processing {section_type} section: rows {start_idx+1} to {end_idx} ({len(section_data)} rows)")
-                
-                # Vectorized RMB client detection
-                col_b_str = section_data[1].astype(str).str.lower()
-                rmb_mask = col_b_str.str.contains('rmb', na=False)
-                rmb_rows = section_data[rmb_mask]
-                
-                # Log non-RMB rows for transparency
-                non_rmb_count = len(section_data) - len(rmb_rows)
-                if non_rmb_count > 0:
-                    skipped_rows['no_rmb'] += non_rmb_count
-                
-                for idx, row in rmb_rows.iterrows():
-                    client_info = str(row[1]).strip()
-                    if not client_info or client_info.lower() == 'nan':
-                        skipped_rows['invalid_client'] += 1
-                        continue
-                    
-                    # Optimized client name cleaning
-                    client_id = re.sub(r'\(rmb\)', '', client_info, flags=re.IGNORECASE).strip()
-                    client_name = re.sub(r'rmb', '', client_id, flags=re.IGNORECASE).strip()
-                    
-                    # Safe vectorized amount extraction
-                    try:
-                        numeric_vals = pd.to_numeric(row[2:], errors='coerce')
-                        non_zero_amounts = numeric_vals[numeric_vals != 0].dropna()
-                        
-                        if non_zero_amounts.empty:
-                            skipped_rows['no_amount'] += 1
-                            continue
-                        
-                        # Safe extraction with bounds checking
-                        amount = float(non_zero_amounts.iat[0] if len(non_zero_amounts) > 0 else 0)
-                        if amount == 0:
-                            skipped_rows['no_amount'] += 1
-                            continue
-                            
-                    except (IndexError, ValueError, TypeError) as e:
-                        logger.warning(f"Amount extraction failed for row {idx}: {e}")
-                        skipped_rows['no_amount'] += 1
-                        continue
-                    
-                    data.append({
-                        'client_id': client_id,
-                        'client_name': client_name,
-                        'code': '240601' if section_type == 'receivables' else '110301',
-                        'amount': amount,
-                        'type': section_type
-                    })
-        
-        # Efficient credit limit extraction with single pass
-        credit_limit_mask = df_str.apply(lambda row: any('credit limit' in cell for cell in row), axis=1)
-        credit_limit_rows = df[credit_limit_mask]
-        
-        logger.info(f"Found {len(credit_limit_rows)} potential credit limit rows")
-        
-        for idx, row in credit_limit_rows.iterrows():
-            try:
-                potential_name = str(row[1]).strip()
-                if 'rmb' not in potential_name.lower():
-                    continue
-                    
-                cleaned_name = re.sub(r'rmb|\(rmb\)', '', potential_name, flags=re.IGNORECASE).strip()
-                
-                # Safe vectorized numeric extraction for credit limits
-                numeric_vals = pd.to_numeric(row[2:], errors='coerce')
-                non_zero_amounts = numeric_vals[numeric_vals != 0].dropna()
-                
-                if len(non_zero_amounts) > 0:
-                    credit_limits[cleaned_name] = float(non_zero_amounts.iat[0])
-            except (IndexError, ValueError, TypeError) as e:
-                logger.warning(f"Credit limit extraction failed for row {idx}: {e}")
-                continue
-
         if not data:
-            logger.error(f"No valid entries found. Skipped: {skipped_rows}")
-            return {"error": "No valid RMB entries found.", "debug": skipped_rows}, 400
-
-        logger.info(f"Successfully extracted {len(data)} entries. Skipped rows: {skipped_rows}")
-
-        # Optimized DataFrame operations
-        df_data = pd.DataFrame(data)
+            return jsonify({
+                "error": "No valid RMB entries found.",
+                "debug": {
+                    "no_rmb": stats.no_rmb,
+                    "no_amount": stats.no_amount,
+                    "invalid_client": stats.invalid_client
+                }
+            }), 400
         
-        # More efficient pivot operation
-        pivot = df_data.groupby(['client_id', 'client_name', 'type'])['amount'].sum().unstack(fill_value=0)
-        
-        # Handle missing columns without loops
-        missing_cols = set(['receivables', 'orders']) - set(pivot.columns)
-        for col in missing_cols:
-            pivot[col] = 0
-            
-        pivot = pivot.reset_index()
-
-        # Vectorized calculations
-        pivot['usd_equivalent'] = (pivot['orders'] / 7.10).round(2)
-        
-        # Efficient credit limit mapping
-        pivot['credit_limit'] = pivot['client_name'].map(credit_limits)
-        pivot['credit_limit'] = pivot['credit_limit'].apply(lambda x: f"{x:.2f}" if pd.notna(x) and x != 0 else "")
-
-        # Single filtering operation with early return
+        # Create result DataFrame
         only_full = request.args.get('only_full', 'true').lower() == 'true'
+        result_df = create_result_dataframe(data, credit_limits, only_full)
         
-        if only_full:
-            result = pivot[(pivot['receivables'] > 0) & (pivot['orders'] > 0)]
-            error_msg = "No clients found with both receivables AND orders"
-        else:
-            result = pivot[(pivot['receivables'] != 0) | (pivot['orders'] != 0)]
-            error_msg = "No clients found with receivables or orders"
+        # Create and send Excel file
+        with create_temp_excel(result_df) as output_path:
+            return send_file(
+                output_path,
+                as_attachment=True,
+                download_name="titus_excel_cleaned_rmb.xlsx",
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+    
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.exception("Unhandled error in process_excel:")
+        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
 
-        if result.empty:
-            return {"error": error_msg}, 400
-
-        # Enhanced debug logging with comprehensive stats
-        total_receivables = result['receivables'].sum()
-        total_orders = result['orders'].sum()
-        net_amount = total_receivables - total_orders
-        
-        logger.info(f"✅ Processing completed successfully:")
-        logger.info(f"   • Clients processed: {len(result)}")
-        logger.info(f"   • Total receivables: {total_receivables:,.2f} RMB")
-        logger.info(f"   • Total orders: {total_orders:,.2f} RMB") 
-        logger.info(f"   • Net receivables: {net_amount:,.2f} RMB")
-        logger.info(f"   • Credit limits found: {len([x for x in result['credit_limit'] if x])}")
-        
-        # Also print for console visibility (backward compatibility)
-        print(f"✅ Processed {len(result)} RMB clients | Receivables: {total_receivables:.2f} | Orders: {total_orders:.2f} | Net: {net_amount:.2f}")
-
-        # Streamlined column selection and renaming
-        column_mapping = {
-            'client_id': 'Client Code',
-            'client_name': 'Client Name',
-            'receivables': 'Receivables (RMB)',
-            'orders': 'Orders (RMB)',
-            'usd_equivalent': 'USD Equivalent',
-            'credit_limit': 'Credit Limit'
-        }
-        
-        result = result[list(column_mapping.keys())].rename(columns=column_mapping)
-
-        # Optimized Excel writing with compression
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-            output_path = tmp.name
-            with pd.ExcelWriter(output_path, engine="xlsxwriter", options={'strings_to_numbers': True}) as writer:
-                result.to_excel(writer, sheet_name="RMB_Report", index=False)
-                
-                # Optional: Add basic formatting for better readability
-                workbook = writer.book
-                worksheet = writer.sheets['RMB_Report']
-                
-                # Format currency columns
-                currency_format = workbook.add_format({'num_format': '#,##0.00'})
-                worksheet.set_column('C:E', 12, currency_format)  # Receivables, Orders, USD columns
-
-        return send_file(
-            output_path,
-            as_attachment=True,
-            download_name="titus_excel_cleaned_rmb.xlsx",
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
-
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False)
     except Exception as e:
         return {"error": f"An error occurred: {str(e)}"}, 500
 
@@ -240,3 +320,4 @@ def health_check():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
