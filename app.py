@@ -4,6 +4,7 @@ import tempfile
 import os
 import re
 import logging
+from flask_cors import CORS
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from contextlib import contextmanager
@@ -218,3 +219,4 @@ def process_excel():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
