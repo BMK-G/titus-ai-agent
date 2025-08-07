@@ -7,7 +7,6 @@ import logging
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from contextlib import contextmanager
-import io
 
 # Configure logging
 logging.basicConfig(
@@ -49,12 +48,10 @@ class ExcelProcessor:
         self.stats = ProcessingStats()
         
     def find_section_indices(self, code: str) -> pd.Index:
-        """Find all rows containing the specified section code."""
         joined = self.df_str.apply(lambda row: ' '.join(row), axis=1)
         return self.df[joined.str.contains(code, na=False)].index
     
     def extract_amount(self, row: pd.Series) -> Optional[float]:
-        """Extract the first non-zero numeric value from row columns 2+."""
         try:
             numeric_vals = pd.to_numeric(row.iloc[2:], errors='coerce')
             non_zero = numeric_vals[numeric_vals != 0].dropna()
@@ -63,19 +60,16 @@ class ExcelProcessor:
             return None
     
     def clean_client_info(self, client_info: str) -> Tuple[str, str]:
-        """Clean and extract client ID and name from client info."""
         client_info = client_info.strip()
         client_id = re.sub(r'\(rmb\)', '', client_info, flags=re.IGNORECASE).strip()
         client_name = re.sub(r'rmb', '', client_id, flags=re.IGNORECASE).strip()
         return client_id, client_name
     
     def process_section(self, section_type: str, start_indices: pd.Index) -> List[ClientData]:
-        """Process a specific section (receivables or orders) and extract client data."""
         data = []
         code = SECTION_CODES[section_type]
         
         for start_idx in start_indices:
-            # Find section boundaries
             remaining_df = self.df_str.iloc[start_idx + 1:]
             next_section_mask = remaining_df.apply(
                 lambda row: any(section_code in ' '.join(row) 
@@ -84,29 +78,20 @@ class ExcelProcessor:
             end_idx = next_section_mask.idxmax() if next_section_mask.any() else len(self.df)
             section_data = self.df.iloc[start_idx + 1:end_idx]
             
-            # Filter rows with RMB
             rmb_mask = section_data.iloc[:, 1].astype(str).str.lower().str.contains('rmb', na=False)
             rmb_rows = section_data[rmb_mask]
             self.stats.no_rmb += len(section_data) - len(rmb_rows)
             
-            # Process each RMB row
             for idx, row in rmb_rows.iterrows():
                 client_info = str(row.iloc[1]).strip()
-                
-                # Validate client info
                 if not client_info or client_info.lower() == 'nan':
                     self.stats.invalid_client += 1
                     continue
-                
-                # Extract amount
                 amount = self.extract_amount(row)
                 if amount is None or amount == 0:
                     self.stats.no_amount += 1
                     continue
-                
-                # Clean client data
                 client_id, client_name = self.clean_client_info(client_info)
-                
                 data.append(ClientData(
                     client_id=client_id,
                     client_name=client_name,
@@ -114,14 +99,10 @@ class ExcelProcessor:
                     amount=amount,
                     type=section_type
                 ))
-        
         return data
     
     def extract_credit_limits(self) -> Dict[str, float]:
-        """Extract credit limits from the Excel file."""
         credit_limits = {}
-        
-        # Find rows containing "credit limit"
         credit_mask = self.df_str.apply(
             lambda row: any('credit limit' in cell for cell in row), axis=1
         )
@@ -132,53 +113,36 @@ class ExcelProcessor:
                 potential_name = str(row.iloc[1]).strip()
                 if 'rmb' not in potential_name.lower():
                     continue
-                
                 cleaned_name = re.sub(r'rmb|\(rmb\)', '', potential_name, flags=re.IGNORECASE).strip()
                 amount = self.extract_amount(row)
-                
                 if amount is not None and amount > 0:
                     credit_limits[cleaned_name] = amount
             except Exception as e:
                 logger.warning(f"Credit limit extraction failed: {e}")
-        
         return credit_limits
     
     def process(self) -> Tuple[List[ClientData], Dict[str, float], ProcessingStats]:
-        """Main processing method."""
         all_data = []
-        
-        # Process each section type
         for section_type in SECTION_CODES:
             indices = self.find_section_indices(SECTION_CODES[section_type])
             section_data = self.process_section(section_type, indices)
             all_data.extend(section_data)
-        
-        # Extract credit limits
         credit_limits = self.extract_credit_limits()
-        
         return all_data, credit_limits, self.stats
 
 @contextmanager
 def create_temp_excel(result_df: pd.DataFrame):
-    """Context manager for creating temporary Excel files."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         output_path = tmp.name
-        
     try:
-        # Create Excel with formatting
-        with pd.ExcelWriter(output_path, engine="xlsxwriter", 
-                          options={'strings_to_numbers': True}) as writer:
+        with pd.ExcelWriter(output_path, engine="xlsxwriter", options={'strings_to_numbers': True}) as writer:
             result_df.to_excel(writer, sheet_name="RMB_Report", index=False)
-            
-            # Apply formatting
             workbook = writer.book
             worksheet = writer.sheets['RMB_Report']
             currency_format = workbook.add_format({'num_format': '#,##0.00'})
-            worksheet.set_column('C:E', 12, currency_format)
-        
+            worksheet.set_column('C:F', 12, currency_format)
         yield output_path
     finally:
-        # Clean up temp file
         if os.path.exists(output_path):
             try:
                 os.unlink(output_path)
@@ -186,20 +150,15 @@ def create_temp_excel(result_df: pd.DataFrame):
                 pass
 
 def load_excel_file(file) -> pd.DataFrame:
-    """Load Excel file with fallback logic."""
     try:
         return pd.read_excel(file, sheet_name=DEFAULT_SHEET, header=None)
     except Exception:
         logger.info(f"Sheet '{DEFAULT_SHEET}' not found, using first sheet")
         return pd.read_excel(file, sheet_name=0, header=None)
 
-def create_result_dataframe(data: List[ClientData], credit_limits: Dict[str, float], 
-                          only_full: bool = True) -> pd.DataFrame:
-    """Create the final result DataFrame with proper formatting."""
+def create_result_dataframe(data: List[ClientData], credit_limits: Dict[str, float], only_full: bool = True) -> pd.DataFrame:
     if not data:
         raise ValueError("No valid data found")
-    
-    # Convert to DataFrame
     df_data = pd.DataFrame([
         {
             'client_id': item.client_id,
@@ -208,47 +167,32 @@ def create_result_dataframe(data: List[ClientData], credit_limits: Dict[str, flo
             'amount': item.amount
         } for item in data
     ])
-    
-    # Pivot and aggregate
     pivot = (df_data.groupby(['client_id', 'client_name', 'type'])['amount']
-             .sum()
-             .unstack(fill_value=0)
-             .reset_index())
-    
-    # Ensure required columns exist
+             .sum().unstack(fill_value=0).reset_index())
     for col in ['receivables', 'orders']:
         if col not in pivot.columns:
             pivot[col] = 0
-    
-    # Calculate derived columns
-    pivot['usd_equivalent'] = (pivot['orders'] / EXCHANGE_RATE).round(2)
+    pivot['total_rmb'] = pivot['receivables'] - pivot['orders']
+    pivot['usd_equivalent'] = (pivot['total_rmb'] / EXCHANGE_RATE).round(2)
     pivot['credit_limit'] = pivot['client_name'].map(credit_limits).fillna('')
-    pivot['credit_limit'] = pivot['credit_limit'].apply(
-        lambda x: f"{x:.2f}" if pd.notna(x) and x != 0 else ""
-    )
-    
-    # Apply filtering
+    pivot['credit_limit'] = pivot['credit_limit'].apply(lambda x: f"{x:.2f}" if pd.notna(x) and x != 0 else "")
     if only_full:
         result = pivot[(pivot['receivables'] > 0) & (pivot['orders'] > 0)]
     else:
         result = pivot[(pivot['receivables'] != 0) | (pivot['orders'] != 0)]
-    
     if result.empty:
         raise ValueError("No clients found matching criteria")
-    
-    # Rename columns for output
     column_mapping = {
         'client_id': 'Client Code',
         'client_name': 'Client Name',
         'receivables': 'Receivables (RMB)',
         'orders': 'Orders (RMB)',
+        'total_rmb': 'Total (RMB)',
         'usd_equivalent': 'USD Equivalent',
         'credit_limit': 'Credit Limit'
     }
-    
     return result[list(column_mapping.keys())].rename(columns=column_mapping)
 
-# Flask Routes
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
@@ -262,20 +206,13 @@ def health_check():
 @app.route("/process", methods=["POST"])
 def process_excel():
     try:
-        # Validate file upload
         if FILE_KEY not in request.files or request.files[FILE_KEY].filename == '':
             return jsonify({"error": f"No valid file uploaded under key '{FILE_KEY}'"}), 400
-
         file = request.files[FILE_KEY]
-        
-        # Load and clean DataFrame
         df = load_excel_file(file)
         df = df.dropna(how='all').reset_index(drop=True)
-        
-        # Process the Excel file
         processor = ExcelProcessor(df)
         data, credit_limits, stats = processor.process()
-        
         if not data:
             return jsonify({
                 "error": "No valid RMB entries found.",
@@ -285,12 +222,8 @@ def process_excel():
                     "invalid_client": stats.invalid_client
                 }
             }), 400
-        
-        # Create result DataFrame
         only_full = request.args.get('only_full', 'true').lower() == 'true'
         result_df = create_result_dataframe(data, credit_limits, only_full)
-        
-        # Create and send Excel file
         with create_temp_excel(result_df) as output_path:
             return send_file(
                 output_path,
@@ -298,7 +231,6 @@ def process_excel():
                 download_name="titus_excel_cleaned_rmb.xlsx",
                 mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             )
-    
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -308,16 +240,3 @@ def process_excel():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
-    except Exception as e:
-        return {"error": f"An error occurred: {str(e)}"}, 500
-
-
-@app.route("/health", methods=["GET"])
-def health_check():
-    return jsonify({"status": "healthy"}), 200
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
-
