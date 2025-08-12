@@ -3,3 +3,4 @@ pandas
 openpyxl
 xlsxwriter
 gunicorn
+flask-cors==6.0.1
