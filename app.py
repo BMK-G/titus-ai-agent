@@ -9,25 +9,36 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from contextlib import contextmanager
 
-# Configure logging
+# ---------------- Logging ----------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('rmb_processing.log')
-    ]
+    handlers=[logging.StreamHandler(), logging.FileHandler('rmb_processing.log')]
 )
 logger = logging.getLogger(__name__)
 
+# ---------------- App ----------------
 app = Flask(__name__)
 
-# Constants
+# Allow uploads up to 16MB (adjust if needed)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+
+# CORS: allow your static UI + localhost for testing
+ui_origin = os.getenv("UI_ORIGIN", "*")  # e.g. set to "https://titus-ui.onrender.com" in Render env if you want to restrict
+CORS(
+    app,
+    resources={r"/*": {"origins": [ui_origin, "http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:5500"]}},
+    methods=["GET", "POST", "OPTIONS"],
+    expose_headers=["Content-Disposition"]
+)
+
+# ---------------- Constants ----------------
 SECTION_CODES = {'receivables': '240601', 'orders': '110301'}
 EXCHANGE_RATE = 7.10
 DEFAULT_SHEET = "Chart of Accounts Status"
 FILE_KEY = 'data'
 
+# ---------------- Data Models ----------------
 @dataclass
 class ProcessingStats:
     no_rmb: int = 0
@@ -42,6 +53,7 @@ class ClientData:
     amount: float
     type: str
 
+# ---------------- Core Processor ----------------
 class ExcelProcessor:
     def __init__(self, df: pd.DataFrame):
         self.df = df
@@ -67,7 +79,9 @@ class ExcelProcessor:
 
         for start_idx in start_indices:
             remaining_df = self.df_str.iloc[start_idx + 1:]
-            next_section_mask = remaining_df.apply(lambda row: any(code in ' '.join(row) for code in SECTION_CODES.values()), axis=1)
+            next_section_mask = remaining_df.apply(
+                lambda row: any(c in ' '.join(row) for c in SECTION_CODES.values()), axis=1
+            )
             end_idx = next_section_mask.idxmax() if next_section_mask.any() else len(self.df)
             section_data = self.df.iloc[start_idx + 1:end_idx]
 
@@ -116,6 +130,7 @@ class ExcelProcessor:
         credit_limits = self.extract_credit_limits()
         return all_data, credit_limits, self.stats
 
+# ---------------- Excel Writer ----------------
 @contextmanager
 def create_temp_excel(result_df: pd.DataFrame):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
@@ -130,16 +145,25 @@ def create_temp_excel(result_df: pd.DataFrame):
         yield output_path
     finally:
         if os.path.exists(output_path):
-            os.unlink(output_path)
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
 
+# ---------------- Helpers ----------------
 def load_excel_file(file) -> pd.DataFrame:
     try:
-        return pd.read_excel(file, sheet_name=DEFAULT_SHEET, header=None)
+        # Be explicit about engine for xlsx
+        return pd.read_excel(file, sheet_name=DEFAULT_SHEET, header=None, engine="openpyxl")
     except Exception:
         logger.info(f"Sheet '{DEFAULT_SHEET}' not found, using first sheet")
-        return pd.read_excel(file, sheet_name=0, header=None)
+        return pd.read_excel(file, sheet_name=0, header=None, engine="openpyxl")
 
-def create_result_dataframe(data: List[ClientData], credit_limits: Dict[str, float], only_full: bool = True) -> pd.DataFrame:
+def create_result_dataframe(
+    data: List[ClientData],
+    credit_limits: Dict[str, float],
+    only_full: bool = True
+) -> pd.DataFrame:
     if not data:
         raise ValueError("No valid data found")
 
@@ -150,10 +174,19 @@ def create_result_dataframe(data: List[ClientData], credit_limits: Dict[str, flo
         'amount': d.amount
     } for d in data])
 
-    pivot = df.pivot_table(index=['client_id', 'client_name'], columns='type', values='amount', aggfunc='sum', fill_value=0).reset_index()
+    pivot = df.pivot_table(
+        index=['client_id', 'client_name'],
+        columns='type',
+        values='amount',
+        aggfunc='sum',
+        fill_value=0
+    ).reset_index()
+
     pivot['total_rmb'] = pivot.get('receivables', 0) - pivot.get('orders', 0)
     pivot['usd_equivalent'] = (pivot['total_rmb'] / EXCHANGE_RATE).round(2)
-    pivot['credit_limit'] = pivot['client_name'].map(credit_limits).apply(lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else '')
+    pivot['credit_limit'] = pivot['client_name'].map(credit_limits).apply(
+        lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else ''
+    )
 
     if only_full:
         pivot = pivot[(pivot.get('receivables', 0) > 0) & (pivot.get('orders', 0) > 0)]
@@ -173,6 +206,7 @@ def create_result_dataframe(data: List[ClientData], credit_limits: Dict[str, flo
         'credit_limit': 'Credit Limit'
     })
 
+# ---------------- Routes ----------------
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({"message": "✅ Titus AI Agent is running. Use the /process route (POST) to upload Excel files."}), 200
@@ -189,6 +223,7 @@ def process_excel():
 
         file = request.files[FILE_KEY]
         df = load_excel_file(file).dropna(how='all').reset_index(drop=True)
+        logger.info(f"/process received file; shape={df.shape}")
 
         processor = ExcelProcessor(df)
         data, credit_limits, stats = processor.process()
@@ -203,6 +238,7 @@ def process_excel():
         result_df = create_result_dataframe(data, credit_limits, only_full)
 
         with create_temp_excel(result_df) as output_path:
+            # Flask will set Content-Disposition; CORS exposes it for the browser
             return send_file(
                 output_path,
                 as_attachment=True,
@@ -211,12 +247,14 @@ def process_excel():
             )
 
     except ValueError as ve:
+        logger.warning(f"/process ValueError: {ve}")
         return jsonify({"error": str(ve)}), 400
     except Exception as e:
         logger.exception("Unhandled error in process_excel:")
         return jsonify({"error": f"An error occurred: {str(e)}"}), 500
 
+# ---------------- Entrypoint ----------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    # For local dev debug=True is fine. On Render use gunicorn start command instead.
     app.run(host="0.0.0.0", port=port, debug=False)
-
