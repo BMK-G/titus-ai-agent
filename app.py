@@ -1,4 +1,4 @@
-from flask import Flask, request, send_file, jsonify, make_response
+from flask import Flask, request, send_file, jsonify
 import pandas as pd
 import io
 import os
@@ -20,10 +20,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------- App ----------------
-app = Flask(__name__)
+app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
-# Enable CORS for local + hosted UI
+# Enable CORS
 ui_origin = os.getenv("UI_ORIGIN", "*")
 CORS(
     app,
@@ -250,16 +250,14 @@ def process_excel():
         result_df = create_result_dataframe(data, credit_limits, only_full)
         xlsx_bytes = dataframe_to_xlsx_bytes(result_df)
 
-        response = make_response(send_file(
+        # ✅ return clean send_file (no make_response)
+        return send_file(
             xlsx_bytes,
             as_attachment=True,
             download_name="titus_excel_cleaned_rmb.xlsx",
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ))
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
-        return response
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            max_age=0
+        )
 
     except ValueError as ve:
         logger.warning(f"/process ValueError: {ve}")
@@ -272,3 +270,4 @@ def process_excel():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
